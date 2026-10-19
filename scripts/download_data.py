@@ -17,7 +17,7 @@ def main() -> None:
 
     DATA_RAW.mkdir(parents=True, exist_ok=True)
     dataset = fetch_ucirepo(id=DATASET_ID)
-    df = pd.concat([dataset.data.features, dataset.data.targets], axis=1)
+    df = pd.concat([dataset.data.ids, dataset.data.features, dataset.data.targets], axis=1)
     df.to_csv(DATA_FILE, index=False)
     dataset.variables.to_csv(VARIABLES_FILE, index=False)
     print(f"Wrote {len(df):,} rows to {DATA_FILE}")

@@ -2,7 +2,6 @@ import pandas as pd
 
 from eda_diabetes.paths import DATA_PROCESSED, DATA_RAW
 
-# Code tables from the dataset's original IDS_mapping.csv.
 ADMISSION_TYPE = {
     1: "Emergency",
     2: "Urgent",
@@ -80,6 +79,145 @@ ID_MAPPINGS = {
     "discharge_disposition_id": DISCHARGE_DISPOSITION,
     "admission_source_id": ADMISSION_SOURCE,
 }
+
+
+MISSING_ID_CODES = {
+    "admission_type_id": {5, 6, 8},
+    "discharge_disposition_id": {18, 25, 26},
+    "admission_source_id": {9, 15, 17, 20, 21},
+}
+
+EXPIRED_HOSPICE_DISCHARGE = {11, 13, 14, 19, 20, 21}
+
+NEAR_CONSTANT_COLUMNS = [
+    "examide",
+    "citoglipton",
+    "glimepiride-pioglitazone",
+    "metformin-rosiglitazone",
+]
+
+
+MEDICATION_COLUMNS = [
+    "metformin",
+    "repaglinide",
+    "nateglinide",
+    "chlorpropamide",
+    "glimepiride",
+    "acetohexamide",
+    "glipizide",
+    "glyburide",
+    "tolbutamide",
+    "pioglitazone",
+    "rosiglitazone",
+    "acarbose",
+    "miglitol",
+    "troglitazone",
+    "tolazamide",
+    "insulin",
+    "glyburide-metformin",
+    "glipizide-metformin",
+    "metformin-pioglitazone",
+]
+
+TOP_SPECIALTIES = 10
+
+DISCHARGE_GROUPS = {
+    "Home": {1, 6, 8},
+    "Facility": {2, 3, 4, 5, 15, 22, 23, 24, 27, 28, 29, 30},
+    "Other": {7, 9, 10, 12, 16, 17},
+}
+
+ADMISSION_SOURCE_GROUPS = {
+    "Referral": {1, 2, 3},
+    "Emergency": {7},
+    "Transfer": {4, 5, 6, 10, 18, 19, 22, 25, 26},
+    "Other": {8, 11, 12, 13, 14, 23, 24},
+}
+
+
+def group_codes(codes: pd.Series, groups: dict[str, set[int]]) -> pd.Series:
+    """Map integer codes to group names. NaN stays "Unknown"."""
+    lookup = {code: name for name, members in groups.items() for code in members}
+    return codes.map(lookup).fillna("Unknown")
+
+
+def icd9_group(code: str | None) -> str:
+    """Map an ICD-9 code to the chapter grouping used by Strack et al. (2014)."""
+    if code is None or pd.isna(code):
+        return "Unknown"
+    if code.startswith("250"):
+        return "Diabetes"
+    if code[0] in "VE":
+        return "Other"
+    value = float(code)
+    if 390 <= value < 460 or int(value) == 785:
+        return "Circulatory"
+    if 460 <= value < 520 or int(value) == 786:
+        return "Respiratory"
+    if 520 <= value < 580 or int(value) == 787:
+        return "Digestive"
+    if 580 <= value < 630 or int(value) == 788:
+        return "Genitourinary"
+    if 140 <= value < 240:
+        return "Neoplasms"
+    if 710 <= value < 740:
+        return "Musculoskeletal"
+    if 800 <= value < 1000:
+        return "Injury"
+    return "Other"
+
+
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the cleaning decisions from notebooks/02_cleaning.ipynb to the raw frame.
+
+    Needs encounter_id and patient_nbr, so re-run scripts/download_data.py if they are absent.
+    """
+    df = df.copy()
+
+    # Rows that cannot be readmitted or are invalid.
+    df = df[~df["discharge_disposition_id"].isin(EXPIRED_HOSPICE_DISCHARGE)]
+    df = df[df["gender"] != "Unknown/Invalid"]
+
+    # One encounter per patient, so encounters are independent.
+    df = df.sort_values("encounter_id").drop_duplicates("patient_nbr", keep="first")
+
+    # NaN means unknown here, except the lab results where it means "not measured".
+    df = df.drop(columns=["weight", *NEAR_CONSTANT_COLUMNS])
+    df[["race", "payer_code", "medical_specialty"]] = df[
+        ["race", "payer_code", "medical_specialty"]
+    ].fillna("Unknown")
+    df[["max_glu_serum", "A1Cresult"]] = df[["max_glu_serum", "A1Cresult"]].fillna("None")
+
+    for col, codes in MISSING_ID_CODES.items():
+        df[col] = df[col].mask(df[col].isin(codes))
+
+    for col in ("diag_1", "diag_2", "diag_3"):
+        df[col] = df[col].map(icd9_group)
+
+    age_order = sorted(df["age"].unique(), key=lambda s: int(s[1:].split("-")[0]))
+    df["age"] = pd.Categorical(df["age"], categories=age_order, ordered=True)
+    df["readmitted"] = pd.Categorical(df["readmitted"], ["NO", ">30", "<30"], ordered=True)
+    df["readmitted_30"] = (df["readmitted"] == "<30").astype(int)
+    visit_cols = ["number_outpatient", "number_emergency", "number_inpatient"]
+    df["total_visits"] = df[visit_cols].sum(axis=1)
+
+    df["discharge_group"] = group_codes(df["discharge_disposition_id"], DISCHARGE_GROUPS)
+    df["admission_source_group"] = group_codes(df["admission_source_id"], ADMISSION_SOURCE_GROUPS)
+
+    top = df["medical_specialty"].value_counts().drop("Unknown", errors="ignore")
+    keep = [*top.index[:TOP_SPECIALTIES], "Unknown"]
+    df["medical_specialty"] = df["medical_specialty"].where(
+        df["medical_specialty"].isin(keep), "Other"
+    )
+
+    meds = df[MEDICATION_COLUMNS]
+    df["n_meds_used"] = (meds != "No").sum(axis=1)
+    df["n_meds_changed"] = meds.isin(["Up", "Down"]).sum(axis=1)
+
+    for col in df.select_dtypes("object"):
+        df[col] = df[col].astype("category")
+
+    return df.reset_index(drop=True)
 
 
 def load_raw() -> pd.DataFrame:
